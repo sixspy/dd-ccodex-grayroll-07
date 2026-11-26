@@ -1,10 +1,11 @@
-"""正式规则 vs 影子草案对比。"""
+"""正式规则 vs 影子草案对比（含全量确认/分步记录与放行账核对）。"""
 from __future__ import annotations
 
 from fastapi import APIRouter, Header, HTTPException
 
 from auth import current_user
 from db import connect
+from policies import is_prod_grade
 from validators import require_int
 
 router = APIRouter(prefix="/api/compare", tags=["compare"])
@@ -17,7 +18,7 @@ def compare_flag_env(flag_id: int, env_id: int, authorization: str | None = Head
     eid = require_int(env_id, "环境", 1)
     with connect() as conn:
         fl = conn.execute("SELECT id, key, title, status FROM flags WHERE id=?", (fid,)).fetchone()
-        env = conn.execute("SELECT id, code, title FROM environments WHERE id=?", (eid,)).fetchone()
+        env = conn.execute("SELECT id, code, title, risk_level FROM environments WHERE id=?", (eid,)).fetchone()
         if not fl or not env:
             raise HTTPException(404, detail="开关或环境不存在")
         official = conn.execute(
@@ -51,12 +52,41 @@ def compare_flag_env(flag_id: int, env_id: int, authorization: str | None = Head
                 (fid, eid),
             ).fetchall()
         ]
+        full_open_grants = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT * FROM full_open_grants WHERE flag_id=? AND env_id=? ORDER BY id DESC",
+                (fid, eid),
+            ).fetchall()
+        ]
+        confirm_records = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT * FROM change_history WHERE flag_id=? AND env_id=? AND action='full_confirm' ORDER BY id DESC",
+                (fid, eid),
+            ).fetchall()
+        ]
+        step_records = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT * FROM change_history WHERE flag_id=? AND env_id=? AND action='schedule_step' ORDER BY id DESC",
+                (fid, eid),
+            ).fetchall()
+        ]
     diffs = []
     if official and release_shadows:
         sh = release_shadows[0]
         for field in ("kind", "percent", "cohort_id"):
             if official[field] != sh.get(field):
                 diffs.append({"field": field, "official": official[field], "shadow": sh.get(field)})
+    official_full_gate = None
+    if official and int(official["percent"]) >= 100:
+        official_full_gate = {
+            "prod_grade": is_prod_grade(env),
+            "percent": official["percent"],
+            "version": official["version"],
+            "granted": any(g["version"] == official["version"] for g in full_open_grants),
+        }
     return {
         "flag": dict(fl),
         "env": dict(env),
@@ -67,6 +97,10 @@ def compare_flag_env(flag_id: int, env_id: int, authorization: str | None = Head
         "recent_releases": recent_releases,
         "diffs": diffs,
         "has_pending_shadow": bool(rule_shadows or release_shadows or kill_shadows),
+        "full_open_grants": full_open_grants,
+        "confirm_records": confirm_records,
+        "step_records": step_records,
+        "official_full_gate": official_full_gate,
     }
 
 

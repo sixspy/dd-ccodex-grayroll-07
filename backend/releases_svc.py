@@ -1,4 +1,9 @@
-"""发布生效：默认甲路径同事务写正式配置；use_shadow 走乙路径。"""
+"""发布生效：默认甲路径同事务写正式配置；use_shadow 走乙路径。
+
+生产闸（乙路径口径，当日封死，禁止第三路）：prod 且比例一百的全量意图
+只进影子全量草案，二次确认后才原子升正，此前正式零改；
+一键直写正式 → 整笔拒写发布与规则，违者正式零增。
+"""
 from __future__ import annotations
 
 import time
@@ -10,10 +15,17 @@ from audit_svc import write_audit, write_history
 from auth import current_user, require_writer
 from db import connect
 from locks import acquire, release
-from policies import assert_flag_publishable, assert_not_killed_or_allow_kill, describe_path
+from policies import (
+    assert_flag_publishable,
+    assert_not_killed_or_allow_kill,
+    describe_path,
+    is_prod_grade,
+)
 from validators import require_int, require_percent, require_rule_kind, require_str
 
 router = APIRouter(prefix="/api/releases", tags=["releases"])
+
+PROD_FULL_GATE_MSG = "生产闸：禁止一键打满百分百；全量意图只进影子全量草案，二次确认后原子升正"
 
 
 class PublishIn(BaseModel):
@@ -24,6 +36,11 @@ class PublishIn(BaseModel):
     cohort_id: int | None = None
     summary: str
     use_shadow: bool = False
+
+
+def _full_on_prod(percent: int, env) -> bool:
+    """全量意图判定：比例一百且环境风险级达生产级（联查环境风险级）。"""
+    return int(percent) >= 100 and is_prod_grade(env)
 
 
 @router.get("")
@@ -49,7 +66,11 @@ def list_releases(authorization: str | None = Header(default=None)):
 
 @router.post("/publish")
 def publish(body: PublishIn, authorization: str | None = Header(default=None)):
-    """正确性口径默认贯彻甲路径：正式发布同事务落库；use_shadow=true 则走乙路径影子草案。"""
+    """正确性口径默认贯彻甲路径：正式发布同事务落库；use_shadow=true 则走乙路径影子草案。
+
+    生产闸：prod 且比例一百时，一键直写正式整笔拒写（违者正式零增）；
+    全量意图只进影子全量草案。
+    """
     user = current_user(authorization)
     require_writer(user)
     fid = require_int(body.flag_id, "开关", 1)
@@ -59,19 +80,26 @@ def publish(body: PublishIn, authorization: str | None = Header(default=None)):
     summary = require_str(body.summary, "发布说明", 4)
     key = f"flag-release:{fid}:{eid}"
     with connect() as conn:
+        fl = conn.execute("SELECT * FROM flags WHERE id=?", (fid,)).fetchone()
+        if not fl:
+            raise HTTPException(404, detail="开关不存在")
+        assert_flag_publishable(fl["status"])
+        assert_not_killed_or_allow_kill(fl["status"])
+        env = conn.execute("SELECT * FROM environments WHERE id=?", (eid,)).fetchone()
+        if not env:
+            raise HTTPException(404, detail="环境不存在")
+        if body.cohort_id and not conn.execute(
+            "SELECT 1 FROM cohorts WHERE id=?", (body.cohort_id,)
+        ).fetchone():
+            raise HTTPException(404, detail="人群不存在")
+        if not body.use_shadow and _full_on_prod(pct, env):
+            # 生产闸拒写痕：只记审计/历史，正式账零增。
+            write_audit(conn, user["username"], "prod_full_rejected", "flag", fid, f"env={env['code']} percent={pct}")
+            write_history(conn, user["username"], "prod_full_rejected", f"生产闸拒写一键全量 percent={pct}", flag_id=fid, env_id=eid)
+            conn.commit()
+            raise HTTPException(409, detail=PROD_FULL_GATE_MSG)
         acquire(conn, key, user["username"])
         try:
-            fl = conn.execute("SELECT * FROM flags WHERE id=?", (fid,)).fetchone()
-            if not fl:
-                raise HTTPException(404, detail="开关不存在")
-            assert_flag_publishable(fl["status"])
-            assert_not_killed_or_allow_kill(fl["status"])
-            if not conn.execute("SELECT 1 FROM environments WHERE id=?", (eid,)).fetchone():
-                raise HTTPException(404, detail="环境不存在")
-            if body.cohort_id and not conn.execute(
-                "SELECT 1 FROM cohorts WHERE id=?", (body.cohort_id,)
-            ).fetchone():
-                raise HTTPException(404, detail="人群不存在")
             now = time.time()
             if body.use_shadow:
                 cur = conn.execute(
@@ -113,15 +141,50 @@ def publish(body: PublishIn, authorization: str | None = Header(default=None)):
             conn.commit()
 
 
-@router.post("/shadow/{shadow_id}/promote")
-def promote_release_shadow(shadow_id: int, authorization: str | None = Header(default=None)):
+@router.post("/shadow/{shadow_id}/confirm")
+def confirm_release_shadow(shadow_id: int, authorization: str | None = Header(default=None)):
+    """二次确认（四眼）：仅生产级环境的百分百影子全量草案需要；确认人与建稿人不得相同。"""
     user = current_user(authorization)
     require_writer(user)
     with connect() as conn:
         sh = conn.execute("SELECT * FROM release_shadows WHERE id=?", (shadow_id,)).fetchone()
         if not sh or sh["status"] != "open":
+            raise HTTPException(400, detail="影子发布不可确认")
+        env = conn.execute("SELECT * FROM environments WHERE id=?", (sh["env_id"],)).fetchone()
+        if not _full_on_prod(sh["percent"], env):
+            raise HTTPException(400, detail="仅生产级全量影子需二次确认")
+        if sh["created_by"] == user["username"]:
+            raise HTTPException(409, detail="二次确认须由他人完成（四眼原则）")
+        conn.execute(
+            "UPDATE release_shadows SET status='confirmed' WHERE id=? AND status='open'",
+            (shadow_id,),
+        )
+        write_audit(
+            conn, user["username"], "full_confirm", "release_shadow", shadow_id,
+            f"env={env['code']} percent={sh['percent']}",
+        )
+        write_history(
+            conn, user["username"], "full_confirm", f"二次确认全量影子 {shadow_id}",
+            flag_id=sh["flag_id"], env_id=sh["env_id"],
+        )
+        conn.commit()
+    return {"id": shadow_id, "status": "confirmed"}
+
+
+@router.post("/shadow/{shadow_id}/promote")
+def promote_release_shadow(shadow_id: int, authorization: str | None = Header(default=None)):
+    """原子升正：生产级全量影子须已二次确认；升正同事务记全量放行账（账实同源）。"""
+    user = current_user(authorization)
+    require_writer(user)
+    with connect() as conn:
+        sh = conn.execute("SELECT * FROM release_shadows WHERE id=?", (shadow_id,)).fetchone()
+        if not sh or sh["status"] not in ("open", "confirmed"):
             raise HTTPException(400, detail="影子发布不可升正")
         fid, eid = sh["flag_id"], sh["env_id"]
+        env = conn.execute("SELECT * FROM environments WHERE id=?", (eid,)).fetchone()
+        full_on_prod = _full_on_prod(sh["percent"], env)
+        if full_on_prod and sh["status"] != "confirmed":
+            raise HTTPException(409, detail="生产级全量影子须二次确认后才可原子升正")
         key = f"flag-release:{fid}:{eid}"
         acquire(conn, key, user["username"])
         try:
@@ -147,6 +210,12 @@ def promote_release_shadow(shadow_id: int, authorization: str | None = Header(de
             )
             rid = cur.lastrowid
             conn.execute("UPDATE release_shadows SET status='promoted' WHERE id=?", (shadow_id,))
+            if full_on_prod:
+                conn.execute(
+                    "INSERT INTO full_open_grants(flag_id, env_id, version, source, granted_by, granted_at, note) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (fid, eid, ver, "confirmed_shadow", user["username"], now, f"release_shadow={shadow_id}"),
+                )
             if fl["status"] in ("draft", "killed"):
                 conn.execute("UPDATE flags SET status='active' WHERE id=?", (fid,))
             write_history(conn, user["username"], "release_promote", f"影子升正 v{ver}", flag_id=fid, env_id=eid)

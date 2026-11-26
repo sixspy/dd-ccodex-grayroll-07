@@ -1,4 +1,8 @@
-"""在线求值：给定主体键，返回开关在某环境是否命中。"""
+"""在线求值：给定主体键，返回开关在某环境是否命中。
+
+生产闸求值侧：生产级环境的百分百正式规则，须同事务跨表核对全量放行账
+（二次确认或分步爬坡而来），无账一律不放开——确认或分步后求值才全开。
+"""
 from __future__ import annotations
 
 from fastapi import APIRouter, Header, HTTPException
@@ -6,7 +10,7 @@ from pydantic import BaseModel
 
 from auth import current_user
 from db import connect
-from policies import combine_rule, eval_percent
+from policies import combine_rule, eval_percent, is_prod_grade
 from validators import require_str
 
 router = APIRouter(prefix="/api/evaluate", tags=["evaluate"])
@@ -73,6 +77,24 @@ def evaluate(body: EvalIn, authorization: str | None = Header(default=None)):
                 "env_code": env_code,
                 "subject_key": subject,
             }
+        if int(rule["percent"]) >= 100 and is_prod_grade(env):
+            # 未确认的全量不得当成已全量：同事务跨表核对全量放行账（账实）。
+            grant = conn.execute(
+                "SELECT 1 FROM full_open_grants WHERE flag_id=? AND env_id=? AND version=?",
+                (fl["id"], env["id"], rule["version"]),
+            ).fetchone()
+            if not grant:
+                return {
+                    "enabled": False,
+                    "reason": "prod_full_unconfirmed",
+                    "kind": rule["kind"],
+                    "percent": rule["percent"],
+                    "version": rule["version"],
+                    "full_gate": "blocked",
+                    "flag_key": flag_key,
+                    "env_code": env_code,
+                    "subject_key": subject,
+                }
         percent_hit = eval_percent(subject, int(rule["percent"]), flag_key)
         cohort_hit = False
         if rule["cohort_id"]:
@@ -99,22 +121,28 @@ def evaluate(body: EvalIn, authorization: str | None = Header(default=None)):
 
 @router.get("/board")
 def eval_board(authorization: str | None = Header(default=None)):
-    """总览：各环境正式规则摘要。"""
+    """总览：各环境正式规则摘要（含全量放行账核对结果）。"""
     current_user(authorization)
     with connect() as conn:
         rows = [
             dict(r)
             for r in conn.execute(
                 """
-                SELECT f.key AS flag_key, f.status, e.code AS env_code, r.kind, r.percent, r.version, r.cohort_id
+                SELECT f.key AS flag_key, f.status, e.code AS env_code, r.kind, r.percent, r.version, r.cohort_id,
+                       g.id AS grant_id
                 FROM flag_rules r
                 JOIN flags f ON f.id=r.flag_id
                 JOIN environments e ON e.id=r.env_id
+                LEFT JOIN full_open_grants g
+                  ON g.flag_id=r.flag_id AND g.env_id=r.env_id AND g.version=r.version
                 WHERE r.official=1
                 ORDER BY f.key, e.risk_level
                 """
             ).fetchall()
         ]
+        for r in rows:
+            r["full_open"] = (r["grant_id"] is not None) if int(r["percent"]) >= 100 else None
+            r.pop("grant_id", None)
         by_status = [
             dict(x)
             for x in conn.execute("SELECT status, COUNT(*) c FROM flags GROUP BY status").fetchall()

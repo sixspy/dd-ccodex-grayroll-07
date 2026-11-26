@@ -1,4 +1,8 @@
-"""灰度调度草案：预约比例爬坡（本地记录，非外部 cron）。"""
+"""灰度调度草案：预约比例爬坡（本地记录，非外部 cron）。
+
+生产闸同口径：生产级环境禁止一步打满（变相一键全量，属第三路，封死）；
+分步爬坡抵达百分百时同事务记全量放行账，求值方全开。
+"""
 from __future__ import annotations
 
 import time
@@ -9,6 +13,7 @@ from pydantic import BaseModel
 from audit_svc import write_audit, write_history
 from auth import current_user, require_writer
 from db import connect
+from policies import is_prod_grade
 from validators import require_int, require_percent, require_str
 
 router = APIRouter(prefix="/api/schedules", tags=["schedules"])
@@ -112,6 +117,10 @@ def apply_next(schedule_id: int, authorization: str | None = Header(default=None
         step = steps[idx]
         pct = require_percent(step.get("percent", 0))
         fid, eid = row["flag_id"], row["env_id"]
+        env = conn.execute("SELECT * FROM environments WHERE id=?", (eid,)).fetchone()
+        full_on_prod = pct >= 100 and is_prod_grade(env)
+        if full_on_prod and idx < 1:
+            raise HTTPException(409, detail="生产闸：分步全量须先经低比例步，禁止一步打满")
         now = time.time()
         old = conn.execute(
             "SELECT * FROM flag_rules WHERE flag_id=? AND env_id=? AND official=1", (fid, eid)
@@ -124,6 +133,12 @@ def apply_next(schedule_id: int, authorization: str | None = Header(default=None
             "VALUES(?,?,?,?,NULL,?,1,?)",
             (fid, eid, "percent", pct, ver, now),
         )
+        if full_on_prod:
+            conn.execute(
+                "INSERT INTO full_open_grants(flag_id, env_id, version, source, granted_by, granted_at, note) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (fid, eid, ver, "schedule_steps", user["username"], now, f"schedule={schedule_id} step={idx + 1}"),
+            )
         conn.execute(
             "UPDATE flags SET status='active' WHERE id=? AND status IN ('draft','killed','active')",
             (fid,),

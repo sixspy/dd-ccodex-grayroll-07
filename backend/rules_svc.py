@@ -1,4 +1,8 @@
-"""灰度规则只读与影子绑定（乙路径草案）。"""
+"""灰度规则只读与影子绑定（乙路径草案）。
+
+生产闸同口径：生产级环境的百分百影子规则须二次确认后才可升正，
+升正同事务记全量放行账；此前正式规则零改。
+"""
 from __future__ import annotations
 
 import time
@@ -10,7 +14,12 @@ from audit_svc import write_audit, write_history
 from auth import current_user, require_writer
 from db import connect
 from locks import acquire, release
-from policies import assert_flag_publishable, assert_not_killed_or_allow_kill, describe_path
+from policies import (
+    assert_flag_publishable,
+    assert_not_killed_or_allow_kill,
+    describe_path,
+    is_prod_grade,
+)
 from validators import require_int, require_percent, require_rule_kind
 
 router = APIRouter(prefix="/api/rules", tags=["rules"])
@@ -22,6 +31,10 @@ class ShadowBindIn(BaseModel):
     kind: str
     percent: int = 0
     cohort_id: int | None = None
+
+
+def _full_on_prod(percent: int, env) -> bool:
+    return int(percent) >= 100 and is_prod_grade(env)
 
 
 @router.get("")
@@ -52,7 +65,7 @@ def list_rules(authorization: str | None = Header(default=None)):
 
 @router.post("/shadow-bind")
 def shadow_bind(body: ShadowBindIn, authorization: str | None = Header(default=None)):
-    """乙路径：只写影子人群/比例绑定，正式规则零改。"""
+    """乙路径：只写影子人群/比例绑定，正式规则零改（全量意图也只进影子）。"""
     user = current_user(authorization)
     require_writer(user)
     fid = require_int(body.flag_id, "开关", 1)
@@ -90,15 +103,50 @@ def shadow_bind(body: ShadowBindIn, authorization: str | None = Header(default=N
             conn.commit()
 
 
-@router.post("/shadow/{shadow_id}/promote")
-def promote_rule_shadow(shadow_id: int, authorization: str | None = Header(default=None)):
+@router.post("/shadow/{shadow_id}/confirm")
+def confirm_rule_shadow(shadow_id: int, authorization: str | None = Header(default=None)):
+    """二次确认（四眼）：仅生产级环境的百分百影子规则需要；确认人与建稿人不得相同。"""
     user = current_user(authorization)
     require_writer(user)
     with connect() as conn:
         sh = conn.execute("SELECT * FROM rule_shadows WHERE id=?", (shadow_id,)).fetchone()
         if not sh or sh["status"] != "open":
+            raise HTTPException(400, detail="影子绑定不可确认")
+        env = conn.execute("SELECT * FROM environments WHERE id=?", (sh["env_id"],)).fetchone()
+        if not _full_on_prod(sh["percent"], env):
+            raise HTTPException(400, detail="仅生产级全量影子需二次确认")
+        if sh["created_by"] == user["username"]:
+            raise HTTPException(409, detail="二次确认须由他人完成（四眼原则）")
+        conn.execute(
+            "UPDATE rule_shadows SET status='confirmed' WHERE id=? AND status='open'",
+            (shadow_id,),
+        )
+        write_audit(
+            conn, user["username"], "full_confirm", "rule_shadow", shadow_id,
+            f"env={env['code']} percent={sh['percent']}",
+        )
+        write_history(
+            conn, user["username"], "full_confirm", f"二次确认全量规则影子 {shadow_id}",
+            flag_id=sh["flag_id"], env_id=sh["env_id"],
+        )
+        conn.commit()
+    return {"id": shadow_id, "status": "confirmed"}
+
+
+@router.post("/shadow/{shadow_id}/promote")
+def promote_rule_shadow(shadow_id: int, authorization: str | None = Header(default=None)):
+    """原子升正：生产级全量影子须已二次确认；升正同事务记全量放行账（账实同源）。"""
+    user = current_user(authorization)
+    require_writer(user)
+    with connect() as conn:
+        sh = conn.execute("SELECT * FROM rule_shadows WHERE id=?", (shadow_id,)).fetchone()
+        if not sh or sh["status"] not in ("open", "confirmed"):
             raise HTTPException(400, detail="影子绑定不可升正")
         fid, eid = sh["flag_id"], sh["env_id"]
+        env = conn.execute("SELECT * FROM environments WHERE id=?", (eid,)).fetchone()
+        full_on_prod = _full_on_prod(sh["percent"], env)
+        if full_on_prod and sh["status"] != "confirmed":
+            raise HTTPException(409, detail="生产级全量影子须二次确认后才可原子升正")
         key = f"flag-rule:{fid}:{eid}"
         acquire(conn, key, user["username"])
         try:
@@ -116,6 +164,12 @@ def promote_rule_shadow(shadow_id: int, authorization: str | None = Header(defau
             )
             rid = cur.lastrowid
             conn.execute("UPDATE rule_shadows SET status='promoted' WHERE id=?", (shadow_id,))
+            if full_on_prod:
+                conn.execute(
+                    "INSERT INTO full_open_grants(flag_id, env_id, version, source, granted_by, granted_at, note) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (fid, eid, ver, "confirmed_shadow", user["username"], now, f"rule_shadow={shadow_id}"),
+                )
             if conn.execute("SELECT status FROM flags WHERE id=?", (fid,)).fetchone()["status"] == "draft":
                 conn.execute("UPDATE flags SET status='active' WHERE id=?", (fid,))
             write_history(conn, user["username"], "rule_promote", f"影子规则升正 v{ver}", flag_id=fid, env_id=eid)

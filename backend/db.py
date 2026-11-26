@@ -163,6 +163,16 @@ CREATE TABLE IF NOT EXISTS contention_marks(
   winner TEXT NOT NULL,
   created_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS full_open_grants(
+  id INTEGER PRIMARY KEY,
+  flag_id INTEGER NOT NULL REFERENCES flags(id),
+  env_id INTEGER NOT NULL REFERENCES environments(id),
+  version INTEGER NOT NULL,
+  source TEXT NOT NULL,
+  granted_by TEXT NOT NULL,
+  granted_at REAL NOT NULL,
+  note TEXT NOT NULL DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS rollout_schedules(
   id INTEGER PRIMARY KEY,
   flag_id INTEGER NOT NULL REFERENCES flags(id),

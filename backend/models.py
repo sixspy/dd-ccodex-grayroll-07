@@ -15,7 +15,7 @@ USERS = {
 FLAG_STATUS = ("draft", "active", "killed", "archived")
 ENV_CODES = ("dev", "staging", "prod")
 RELEASE_STATUS = ("draft", "published", "rolled_back")
-SHADOW_STATUS = ("open", "promoted", "discarded")
+SHADOW_STATUS = ("open", "confirmed", "promoted", "discarded")
 RULE_KINDS = ("percent", "cohort", "percent_and_cohort")
 OVERRIDE_EFFECT = ("force_on", "force_off")
 

@@ -28,7 +28,15 @@ def test_schedule_list():
 def test_restore_killed_flag():
     with TestClient(app) as client:
         h = _h(client)
-        # flag 4 is killed in seed
+        # 幂等前置：确保 flag 4 处于已熔断（同一数据库重复跑套件时不依赖种子状态）
+        fl = client.get("/api/flags/4", headers=h).json()
+        if fl["status"] != "killed":
+            k = client.post(
+                "/api/kill",
+                headers=h,
+                json={"flag_id": 4, "env_id": 3, "reason": "恢复测试前置熔断"},
+            )
+            assert k.status_code == 200, k.text
         r = client.post(
             "/api/restore",
             headers=h,

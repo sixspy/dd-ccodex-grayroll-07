@@ -13,11 +13,17 @@ export const EnvsView = {
   template: `
   <div class="panel">
     <h2>环境</h2>
-    <p class="hint">风险等级越高，发布与熔断越敏感；生产环境默认需更谨慎的发布说明。</p>
+    <p class="hint">风险等级越高，发布与熔断越敏感；生产级环境由生产闸接管：禁一键全量，全量意图只进影子全量草案，二次确认或分步爬坡后求值才全开。</p>
     <div class="err" v-if="err">{{ err }}</div>
     <table>
-      <thead><tr><th>代码</th><th>名称</th><th>风险等级</th></tr></thead>
-      <tbody><tr v-for="it in items" :key="it.id"><td>{{ it.code }}</td><td>{{ it.title }}</td><td>{{ it.risk_level }}</td></tr></tbody>
+      <thead><tr><th>代码</th><th>名称</th><th>风险等级</th><th>生产闸</th><th>全量策略</th></tr></thead>
+      <tbody>
+        <tr v-for="it in items" :key="it.id">
+          <td>{{ it.code }}</td><td>{{ it.title }}</td><td>{{ it.risk_level }}</td>
+          <td><span class="pill danger" v-if="it.prod_gate">禁一键全量</span><span class="muted" v-else>—</span></td>
+          <td>{{ it.full_policy }}</td>
+        </tr>
+      </tbody>
     </table>
   </div>`
 };

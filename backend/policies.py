@@ -8,6 +8,19 @@ from fastapi import HTTPException
 WRITE_OFFICIAL = "official"
 WRITE_SHADOW = "shadow"
 
+# 生产闸：风险级达到该值即生产级环境，全量意图联查此级（同事务跨表账实）。
+PROD_RISK_LEVEL = 3
+
+
+def is_prod_grade(env) -> bool:
+    """联查环境风险级：risk_level >= PROD_RISK_LEVEL 视为生产级环境。"""
+    if env is None:
+        return False
+    try:
+        return int(env["risk_level"]) >= PROD_RISK_LEVEL
+    except (KeyError, TypeError, ValueError):
+        return False
+
 H3_PATHS = {
     "release": {
         WRITE_OFFICIAL: "同事务写入正式生效配置并升版本，旧正式规则被新版本覆盖",
